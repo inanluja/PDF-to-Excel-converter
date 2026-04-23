@@ -108,49 +108,70 @@ def group_words_into_rows(words, y_tolerance=4):
 
 def extract_pdf_data(pdf_path):
     """
-    Extract holdings data from the PASHA Kapital trade report PDF.
-    Uses extract_text with high x_tolerance to handle spaced-out characters.
+    Extract holdings data using word-coordinate filtering.
+    The PDF interleaves characters from multiple rows, so we identify securities
+    by collapsing spaces in row text, then filter numbers by X position
+    (amounts are always in the rightmost columns of the table).
     """
     holdings = {}
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            # High x_tolerance merges spaced characters like "V A N G U A R D" → "VANGUARD"
-            text = page.extract_text(x_tolerance=30, y_tolerance=4) or ""
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
+            words = page.extract_words(x_tolerance=3, y_tolerance=2)
+            if not words:
+                continue
 
-            for i, line in enumerate(lines):
-                sec_name = identify_security_from_text(line)
+            # Rightmost 35% of page = amount columns
+            max_x = max(w["x0"] for w in words)
+            amount_x_start = max_x * 0.68
+
+            words_sorted = sorted(words, key=lambda w: (w["top"], w["x0"]))
+            rows = group_words_into_rows(words_sorted, y_tolerance=2)
+
+            for i, row in enumerate(rows):
+                # Remove all spaces and hyphens for keyword matching
+                joined = "".join(w["text"] for w in row).upper().replace("-", "")
+
+                sec_name = None
+                for canonical, pdf_kws, _ in SECURITIES:
+                    for kw in pdf_kws:
+                        if kw.upper().replace(" ", "").replace("-", "") in joined:
+                            sec_name = canonical
+                            break
+                    if sec_name:
+                        break
+
                 if not sec_name or sec_name in holdings:
                     continue
 
-                # Grab numbers from 2 lines before and 3 lines after the security name
-                context_lines = lines[max(0, i - 2): min(len(lines), i + 4)]
-                context = " ".join(context_lines)
+                # Collect numbers from the rightmost columns across this row ± 3 rows
+                right_nums = []
+                for check_row in rows[max(0, i - 1): min(len(rows), i + 4)]:
+                    for w in check_row:
+                        if w["x0"] >= amount_x_start:
+                            n = parse_number(w["text"])
+                            if n is not None and abs(n) > 50:
+                                right_nums.append((w["x0"], abs(n)))
 
-                # Extract all numbers including bracketed negatives
-                raw_nums = re.findall(r"\([\d,]+\.?\d*\)|[\d,]+\.\d+", context)
-                nums = []
-                for rn in raw_nums:
-                    n = parse_number(rn)
-                    if n is not None:
-                        nums.append(abs(n))
+                right_nums.sort(key=lambda x: x[0])
+                nums = [n for _, n in right_nums]
 
                 print(f"\n  {sec_name}")
-                print(f"  Line  : {line[:120]}")
-                print(f"  Nums  : {[round(n, 2) for n in nums]}")
+                print(f"  Row   : {''.join(w['text'] for w in row)[:80]}")
+                print(f"  x>{amount_x_start:.0f} nums: {[round(n,2) for n in nums]}")
 
-                h = {"name": sec_name, "all_numbers": nums}
+                h = {"name": sec_name, "nums": nums}
 
-                # Quantity: small integer in the line itself
-                int_matches = re.findall(r"\b(\d{1,4})\b", line)
-                for m in int_matches:
-                    v = int(m)
-                    if 1 <= v <= 5000:
-                        h["quantity"] = v
-                        break
+                # Quantity: small integer in the row itself (1–5000, no decimal)
+                for w in row:
+                    t = w["text"].replace(",", "")
+                    if re.match(r"^\d{1,4}$", t):
+                        v = int(t)
+                        if 1 <= v <= 5000:
+                            h["quantity"] = v
+                            break
 
-                # Assign amounts — last 4 numbers: open_ccy, open_azn, close_ccy, close_azn
+                # Last 4 right-side numbers = open_ccy, open_azn, close_ccy, close_azn
                 if len(nums) >= 4:
                     h["opening_ccy"] = nums[-4]
                     h["opening_azn"] = nums[-3]
