@@ -115,7 +115,7 @@ def extract_pdf_data(pdf_path):
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            words = page.extract_words(x_tolerance=3, y_tolerance=3,
+            words = page.extract_words(x_tolerance=15, y_tolerance=3,
                                        keep_blank_chars=False)
             if not words:
                 continue
