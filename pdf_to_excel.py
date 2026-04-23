@@ -1,6 +1,6 @@
 """
 PDF Trade Report → Excel Portfolio Report converter
-PASHA Kapital → PASHA Private Banking format
+PASHA Kapital trade report → PASHA Private Banking portfolio format
 
 Usage:
     python pdf_to_excel.py <input.pdf> <template.xlsx> [output.xlsx]
@@ -8,36 +8,77 @@ Usage:
 
 import sys
 import re
+import os
 import pdfplumber
 import openpyxl
-from openpyxl.utils import get_column_letter
-from copy import copy
-import os
 
 
-# ── PDF extraction ──────────────────────────────────────────────────────────
+# ── Security definitions ────────────────────────────────────────────────────
+# Each entry: (canonical_name, pdf_keywords, excel_keywords)
+# pdf_keywords   — must appear in the PDF row text to identify the security
+# excel_keywords — must appear in the Excel cell to match the row
 
-SECURITY_ALIASES = {
-    "SPDR S&P 500 ETF TRUST": "SPDR S&P 500 ETF TRUST (SPY)",
-    "SPY": "SPDR S&P 500 ETF TRUST (SPY)",
-    "SPDR GOLD": "SPDR GOLD SHARES (GLD)",
-    "GLD": "SPDR GOLD SHARES (GLD)",
-    "VANGUARD MID-CAP": "VANGUARD MID-CAP ETF (VO)",
-    "MID-CAP ETF": "VANGUARD MID-CAP ETF (VO)",
-    "ISHARES 7-10": "iShares 7-10 YEAR TREASURY BOND (IEF)",
-    "7-10 YEAR TREASURY": "iShares 7-10 YEAR TREASURY BOND (IEF)",
-    "ISHARES 1-5": "iSHARES 1-5Y INVESTMENT GRADE CORP BOND",
-    "1-5Y": "iSHARES 1-5Y INVESTMENT GRADE CORP BOND",
-    "INV GRADE CORP": "iSHARES 1-5Y INVESTMENT GRADE CORP BOND",
-}
+SECURITIES = [
+    (
+        "SPDR S&P 500 ETF TRUST (SPY)",
+        ["S&P", "SPY"],
+        ["SPY", "S&P 500"],
+    ),
+    (
+        "SPDR GOLD SHARES (GLD)",
+        ["GOLD SHARES", "GLD"],
+        ["GLD", "GOLD SHARES"],
+    ),
+    (
+        "VANGUARD MID-CAP ETF (VO)",
+        ["MID-CAP", "VANGUARD"],
+        ["MID-CAP", "VO)"],
+    ),
+    (
+        "iShares 7-10 YEAR TREASURY BOND (IEF)",
+        ["7-10", "IEF"],
+        ["IEF", "7-10"],
+    ),
+    (
+        "iSHARES 1-5Y INVESTMENT GRADE CORP BOND",
+        ["1-5Y", "INV GRADE", "GRADE CORP"],
+        ["GRADE CORP", "1-5Y", "IGIB"],
+    ),
+]
 
-def clean_number(text):
-    """Parse a number string like '(1,234.56)' or '31,083.76' → float."""
-    if text is None:
+
+def identify_security_from_text(text):
+    """Return canonical name if text contains PDF keywords for a security."""
+    text_upper = text.upper()
+    for canonical, pdf_kws, _ in SECURITIES:
+        for kw in pdf_kws:
+            if kw.upper() in text_upper:
+                return canonical
+    return None
+
+
+def excel_row_matches(cell_value, canonical_name):
+    """Return True if the Excel cell matches the canonical security name."""
+    if not cell_value:
+        return False
+    cell_upper = str(cell_value).upper()
+    for name, _, excel_kws in SECURITIES:
+        if name == canonical_name:
+            for kw in excel_kws:
+                if kw.upper() in cell_upper:
+                    return True
+    return False
+
+
+# ── Number parsing ──────────────────────────────────────────────────────────
+
+def parse_number(text):
+    """Parse '(31,083.76)' or '31,083.76' or '31083.76' → float or None."""
+    if not text:
         return None
-    text = str(text).strip().replace(" ", "").replace(",", "")
+    text = str(text).strip()
     negative = text.startswith("(") and text.endswith(")")
-    text = text.strip("()")
+    text = text.strip("()").replace(",", "").replace(" ", "")
     try:
         val = float(text)
         return -val if negative else val
@@ -45,214 +86,191 @@ def clean_number(text):
         return None
 
 
-def normalize_security_name(raw):
-    """Map raw PDF security name to the canonical Excel name."""
-    raw_upper = raw.upper()
-    for key, canonical in SECURITY_ALIASES.items():
-        if key.upper() in raw_upper:
-            return canonical
-    return raw.strip()
+def group_words_into_rows(words, y_tolerance=4):
+    """Group pdfplumber words into rows by similar Y coordinate."""
+    if not words:
+        return []
+    rows = []
+    current_row = [words[0]]
+    current_y = words[0]["top"]
+    for word in words[1:]:
+        if abs(word["top"] - current_y) <= y_tolerance:
+            current_row.append(word)
+        else:
+            rows.append(sorted(current_row, key=lambda w: w["x0"]))
+            current_row = [word]
+            current_y = word["top"]
+    rows.append(sorted(current_row, key=lambda w: w["x0"]))
+    return rows
 
+
+# ── PDF extraction ──────────────────────────────────────────────────────────
 
 def extract_pdf_data(pdf_path):
     """
-    Extract all relevant numbers from the PASHA Kapital trade report PDF.
-    Returns a dict with:
-        holdings     : list of dicts per security
-        commissions  : dict with broker/management totals
-        report_date  : string
-        client_name  : string
+    Extract holdings data from the PASHA Kapital trade report PDF.
+    Uses word-coordinate approach instead of table parsing for reliability.
     """
-    data = {
-        "holdings": [],
-        "commissions": {"broker_ccy": None, "broker_azn": None,
-                        "management_ccy": None, "management_azn": None,
-                        "total_ccy": None, "total_azn": None},
-        "report_date": "",
-        "client_name": "",
-        "total_opening_ccy": None,
-        "total_opening_azn": None,
-        "total_closing_ccy": None,
-        "total_closing_azn": None,
-    }
+    holdings = {}   # canonical_name → dict of values
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            text = page.extract_text() or ""
-            tables = page.extract_tables()
+            words = page.extract_words(x_tolerance=3, y_tolerance=3,
+                                       keep_blank_chars=False)
+            if not words:
+                continue
 
-            # ── Client / date from header text ──
-            for line in text.splitlines():
-                if "Müştərinin adı" in line or "Customer name" in line:
-                    parts = line.split("/")
-                    if len(parts) > 1:
-                        data["client_name"] = parts[-1].strip()
-                if re.search(r"\d{1,2}\s+\w+\s+20\d{2}", line):
-                    m = re.search(r"(\d{1,2}[./]\d{1,2}[./]20\d{2})", line)
-                    if m and not data["report_date"]:
-                        data["report_date"] = m.group(1)
+            words_sorted = sorted(words, key=lambda w: (round(w["top"] / 3) * 3, w["x0"]))
+            rows = group_words_into_rows(words_sorted, y_tolerance=5)
 
-            # ── Parse tables ──
-            for table in tables:
-                if not table:
+            for i, row in enumerate(rows):
+                row_text = " ".join(w["text"] for w in row)
+                sec_name = identify_security_from_text(row_text)
+                if not sec_name:
                     continue
-                for row in table:
-                    clean_row = [str(c).strip() if c else "" for c in row]
-                    row_text = " ".join(clean_row).upper()
 
-                    # Detect holdings rows — rows containing known security keywords
-                    sec_name = None
-                    for key in SECURITY_ALIASES:
-                        if key.upper() in row_text:
-                            sec_name = normalize_security_name(key)
-                            break
+                # Collect words from this row and the next 2 rows
+                # (multi-line table cells sometimes split across rows)
+                combined_words = list(row)
+                for j in range(i + 1, min(i + 3, len(rows))):
+                    next_text = " ".join(w["text"] for w in rows[j])
+                    if identify_security_from_text(next_text):
+                        break   # stop if next row is a different security
+                    combined_words.extend(rows[j])
 
-                    if sec_name:
-                        # Try to extract numeric columns from the row
-                        numbers = []
-                        for cell in clean_row:
-                            n = clean_number(cell)
-                            if n is not None:
-                                numbers.append(n)
+                # Extract all positive numbers with their X positions
+                # (negative amounts appear in brackets which we handle)
+                num_positions = []
+                for w in combined_words:
+                    n = parse_number(w["text"])
+                    if n is not None:
+                        num_positions.append((w["x0"], abs(n), w["text"]))
 
-                        holding = {"name": sec_name, "numbers": numbers}
+                # Sort by X (left → right = earlier → later columns)
+                num_positions.sort(key=lambda x: x[0])
+                nums = [n for _, n, _ in num_positions]
 
-                        # Try to assign columns by position heuristics
-                        # PDF main table order (approximate):
-                        # lot/qty | price_type_cols... | opening_ccy | opening_azn | closing_ccy | closing_azn
-                        if len(numbers) >= 4:
-                            holding["quantity"] = int(numbers[0]) if numbers[0] == int(numbers[0]) else numbers[0]
-                            # last 4 numbers: open_ccy, open_azn, close_ccy, close_azn
-                            holding["opening_ccy"] = numbers[-4]
-                            holding["opening_azn"] = numbers[-3]
-                            holding["closing_ccy"] = numbers[-2]
-                            holding["closing_azn"] = numbers[-1]
-                        elif len(numbers) >= 2:
-                            holding["opening_ccy"] = numbers[-2]
-                            holding["closing_ccy"] = numbers[-1]
+                print(f"  {sec_name}: found {len(nums)} numbers: {[round(n,2) for n in nums]}")
 
-                        data["holdings"].append(holding)
+                if sec_name not in holdings:
+                    holdings[sec_name] = {"name": sec_name}
 
-                    # Detect commission summary rows
-                    if "TOTAL" in row_text or "CƏMİ" in row_text or "CƏMI" in row_text:
-                        nums = [clean_number(c) for c in clean_row if clean_number(c) is not None]
-                        if len(nums) >= 2:
-                            data["commissions"]["total_ccy"] = nums[-2]
-                            data["commissions"]["total_azn"] = nums[-1]
+                h = holdings[sec_name]
 
-    return data
+                # Quantity: a small integer (typically 1–5000)
+                for _, n, raw in num_positions:
+                    if n == int(n) and 1 <= n <= 9999 and "." not in raw:
+                        h["quantity"] = int(n)
+                        break
+
+                # The last 4 numbers in the row are typically:
+                # opening_ccy, opening_azn, closing_ccy, closing_azn
+                if len(nums) >= 4:
+                    h["opening_ccy"]  = nums[-4]
+                    h["opening_azn"]  = nums[-3]
+                    h["closing_ccy"]  = nums[-2]
+                    h["closing_azn"]  = nums[-1]
+                elif len(nums) >= 2:
+                    h["opening_ccy"]  = nums[-2]
+                    h["closing_ccy"]  = nums[-1]
+                elif len(nums) == 1:
+                    h["opening_ccy"]  = nums[0]
+
+    return list(holdings.values())
 
 
 # ── Excel update ─────────────────────────────────────────────────────────────
 
-def find_cell(ws, search_text, search_cols=None, max_row=100):
-    """Find first cell containing search_text (case-insensitive)."""
+def find_cell(ws, search_text, max_row=120):
+    """Find first cell whose value contains search_text (case-insensitive)."""
     for row in ws.iter_rows(min_row=1, max_row=max_row):
         for cell in row:
-            if search_cols and cell.column not in search_cols:
-                continue
             if cell.value and search_text.lower() in str(cell.value).lower():
                 return cell
     return None
 
 
-def update_excel(template_path, data, output_path):
+def update_excel(template_path, holdings, output_path):
     wb = openpyxl.load_workbook(template_path)
 
-    # Work on the first sheet named FINAL (or first sheet)
-    sheet_name = None
+    # Pick sheet: prefer one named FINAL
+    ws = wb.active
     for name in wb.sheetnames:
         if "FINAL" in name.upper():
-            sheet_name = name
+            ws = wb[name]
             break
-    ws = wb[sheet_name] if sheet_name else wb.active
+    print(f"  Sheet: {ws.title}")
 
-    print(f"  Updating sheet: {ws.title}")
-
-    # ── Update Holdings table ──────────────────────────────────────────────
-    # Find the "Name" header in the holdings table
+    # Locate the Holdings header row
     name_header = find_cell(ws, "Name")
-    if name_header:
-        name_col = name_header.column
-        header_row = name_header.row
+    if not name_header:
+        print("  ERROR: Could not find 'Name' header in Excel sheet.")
+        print("  Sheets available:", wb.sheetnames)
+        return
 
-        # Read column headers in that row to find Quantity, Executed Price, etc.
-        col_map = {}
-        for cell in ws[header_row]:
-            if cell.value:
-                val = str(cell.value).lower()
-                if "name" in val:
-                    col_map["name"] = cell.column
-                elif "quantity" in val or "qty" in val:
-                    col_map["quantity"] = cell.column
-                elif "executed" in val or "exec" in val:
-                    col_map["executed_price"] = cell.column
-                elif "trading" in val:
-                    col_map["trading_value"] = cell.column
-                elif "current price" in val:
-                    col_map["current_price"] = cell.column
-                elif "current value" in val:
-                    col_map["current_value"] = cell.column
+    name_col    = name_header.column
+    header_row  = name_header.row
 
-        print(f"  Found holdings header at row {header_row}, columns: {col_map}")
+    # Map column headers → column numbers
+    col_map = {}
+    for cell in ws[header_row]:
+        if not cell.value:
+            continue
+        v = str(cell.value).lower().strip()
+        if "name"             in v:  col_map["name"]            = cell.column
+        elif "quantity"       in v:  col_map["quantity"]        = cell.column
+        elif "qty"            in v:  col_map["quantity"]        = cell.column
+        elif "executed"       in v:  col_map["executed_price"]  = cell.column
+        elif "trading value"  in v:  col_map["trading_value"]   = cell.column
+        elif "current price"  in v:  col_map["current_price"]   = cell.column
+        elif "current value"  in v:  col_map["current_value"]   = cell.column
 
-        # Match PDF holdings to Excel rows by security name
-        for pdf_holding in data["holdings"]:
-            # Scan rows below header to find matching security
-            for r in range(header_row + 1, header_row + 20):
-                cell_val = ws.cell(row=r, column=name_col).value
-                if not cell_val:
-                    continue
-                cell_name = str(cell_val).strip().upper()
-                pdf_name = pdf_holding["name"].upper()
+    print(f"  Holdings header at row {header_row}, columns: {col_map}")
 
-                # Match if any significant word overlaps
-                match = any(
-                    word in cell_name
-                    for word in pdf_name.split()
-                    if len(word) > 3
-                )
+    updated = 0
+    for holding in holdings:
+        sec_name = holding["name"]
 
-                if match:
-                    print(f"    Matched: '{cell_val}' ← {pdf_holding['name']}")
+        # Find the Excel row that matches this security
+        matched_row = None
+        for r in range(header_row + 1, header_row + 25):
+            cell_val = ws.cell(row=r, column=name_col).value
+            if excel_row_matches(cell_val, sec_name):
+                matched_row = r
+                break
 
-                    if "quantity" in col_map and "quantity" in pdf_holding:
-                        ws.cell(row=r, column=col_map["quantity"]).value = pdf_holding["quantity"]
+        if matched_row is None:
+            print(f"  WARNING: No Excel row found for '{sec_name}'")
+            continue
 
-                    if "executed_price" in col_map and "opening_ccy" in pdf_holding:
-                        # Executed price = opening amount / quantity
-                        qty = pdf_holding.get("quantity", 1) or 1
-                        ws.cell(row=r, column=col_map["executed_price"]).value = round(
-                            pdf_holding["opening_ccy"] / qty, 2
-                        )
+        print(f"  Updating row {matched_row}: {ws.cell(row=matched_row, column=name_col).value}")
 
-                    if "trading_value" in col_map and "opening_ccy" in pdf_holding:
-                        ws.cell(row=r, column=col_map["trading_value"]).value = pdf_holding["opening_ccy"]
+        qty = holding.get("quantity", 1) or 1
 
-                    if "current_price" in col_map and "closing_ccy" in pdf_holding:
-                        qty = pdf_holding.get("quantity", 1) or 1
-                        ws.cell(row=r, column=col_map["current_price"]).value = round(
-                            pdf_holding["closing_ccy"] / qty, 2
-                        )
+        if "quantity" in col_map and "quantity" in holding:
+            ws.cell(row=matched_row, column=col_map["quantity"]).value = holding["quantity"]
 
-                    if "current_value" in col_map and "closing_ccy" in pdf_holding:
-                        ws.cell(row=r, column=col_map["current_value"]).value = pdf_holding["closing_ccy"]
+        if "executed_price" in col_map and "opening_ccy" in holding:
+            ws.cell(row=matched_row, column=col_map["executed_price"]).value = round(
+                holding["opening_ccy"] / qty, 2
+            )
 
-                    break
-    else:
-        print("  WARNING: Could not find 'Name' header in Excel — check the template sheet.")
+        if "trading_value" in col_map and "opening_ccy" in holding:
+            ws.cell(row=matched_row, column=col_map["trading_value"]).value = holding["opening_ccy"]
 
-    # ── Update commission / fee rows ──────────────────────────────────────
-    if data["commissions"]["total_ccy"] is not None:
-        mgmt_cell = find_cell(ws, "Management Fee")
-        if mgmt_cell:
-            # Fee is typically 2 columns to the right of the label
-            fee_col = mgmt_cell.column + 2
-            ws.cell(row=mgmt_cell.row, column=fee_col).value = -abs(data["commissions"]["total_ccy"])
-            print(f"  Updated Management Fee: {data['commissions']['total_ccy']}")
+        if "current_price" in col_map and "closing_ccy" in holding:
+            ws.cell(row=matched_row, column=col_map["current_price"]).value = round(
+                holding["closing_ccy"] / qty, 2
+            )
+
+        if "current_value" in col_map and "closing_ccy" in holding:
+            ws.cell(row=matched_row, column=col_map["current_value"]).value = holding["closing_ccy"]
+
+        updated += 1
 
     wb.save(output_path)
-    print(f"\n  Saved: {output_path}")
+    print(f"\n  Updated {updated}/{len(holdings)} holdings")
+    print(f"  Saved: {output_path}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -260,20 +278,17 @@ def update_excel(template_path, data, output_path):
 def main():
     if len(sys.argv) < 3:
         print("Usage: python pdf_to_excel.py <input.pdf> <template.xlsx> [output.xlsx]")
-        print("\nExample:")
-        print("  python pdf_to_excel.py trade_report.pdf portfolio_template.xlsx output.xlsx")
         sys.exit(1)
 
-    pdf_path = sys.argv[1]
+    pdf_path      = sys.argv[1]
     template_path = sys.argv[2]
 
-    # Default: save output next to the PDF file
     if len(sys.argv) > 3:
         output_path = sys.argv[3]
     else:
-        pdf_dir = os.path.dirname(os.path.abspath(pdf_path))
-        pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-        output_path = os.path.join(pdf_dir, f"{pdf_name}_portfolio.xlsx")
+        pdf_dir  = os.path.dirname(os.path.abspath(pdf_path))
+        pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+        output_path = os.path.join(pdf_dir, f"{pdf_stem}_portfolio.xlsx")
 
     if not os.path.exists(pdf_path):
         print(f"ERROR: PDF not found: {pdf_path}")
@@ -282,16 +297,15 @@ def main():
         print(f"ERROR: Template not found: {template_path}")
         sys.exit(1)
 
-    print(f"Extracting data from: {pdf_path}")
-    data = extract_pdf_data(pdf_path)
+    print(f"Extracting from: {pdf_path}\n")
+    holdings = extract_pdf_data(pdf_path)
 
-    print(f"\nExtracted {len(data['holdings'])} holdings:")
-    for h in data["holdings"]:
-        print(f"  {h['name']}: {h}")
+    print(f"\nExtracted {len(holdings)} holdings:")
+    for h in holdings:
+        print(f"  {h}")
 
-    print(f"\nUpdating Excel template: {template_path}")
-    update_excel(template_path, data, output_path)
-
+    print(f"\nUpdating: {template_path}")
+    update_excel(template_path, holdings, output_path)
     print("\nDone!")
 
 
