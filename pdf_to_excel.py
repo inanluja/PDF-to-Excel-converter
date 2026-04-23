@@ -109,72 +109,60 @@ def group_words_into_rows(words, y_tolerance=4):
 def extract_pdf_data(pdf_path):
     """
     Extract holdings data from the PASHA Kapital trade report PDF.
-    Uses word-coordinate approach instead of table parsing for reliability.
+    Uses extract_text with high x_tolerance to handle spaced-out characters.
     """
-    holdings = {}   # canonical_name → dict of values
+    holdings = {}
 
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
-            words = page.extract_words(x_tolerance=15, y_tolerance=3,
-                                       keep_blank_chars=False)
-            if not words:
-                continue
+            # High x_tolerance merges spaced characters like "V A N G U A R D" → "VANGUARD"
+            text = page.extract_text(x_tolerance=30, y_tolerance=4) or ""
+            lines = [l.strip() for l in text.split("\n") if l.strip()]
 
-            words_sorted = sorted(words, key=lambda w: (round(w["top"] / 3) * 3, w["x0"]))
-            rows = group_words_into_rows(words_sorted, y_tolerance=5)
-
-            for i, row in enumerate(rows):
-                row_text = " ".join(w["text"] for w in row)
-                sec_name = identify_security_from_text(row_text)
-                if not sec_name:
+            for i, line in enumerate(lines):
+                sec_name = identify_security_from_text(line)
+                if not sec_name or sec_name in holdings:
                     continue
 
-                # Collect words from this row and the next 2 rows
-                # (multi-line table cells sometimes split across rows)
-                combined_words = list(row)
-                for j in range(i + 1, min(i + 3, len(rows))):
-                    next_text = " ".join(w["text"] for w in rows[j])
-                    if identify_security_from_text(next_text):
-                        break   # stop if next row is a different security
-                    combined_words.extend(rows[j])
+                # Grab numbers from 2 lines before and 3 lines after the security name
+                context_lines = lines[max(0, i - 2): min(len(lines), i + 4)]
+                context = " ".join(context_lines)
 
-                # Extract all positive numbers with their X positions
-                # (negative amounts appear in brackets which we handle)
-                num_positions = []
-                for w in combined_words:
-                    n = parse_number(w["text"])
+                # Extract all numbers including bracketed negatives
+                raw_nums = re.findall(r"\([\d,]+\.?\d*\)|[\d,]+\.\d+", context)
+                nums = []
+                for rn in raw_nums:
+                    n = parse_number(rn)
                     if n is not None:
-                        num_positions.append((w["x0"], abs(n), w["text"]))
+                        nums.append(abs(n))
 
-                # Sort by X (left → right = earlier → later columns)
-                num_positions.sort(key=lambda x: x[0])
-                nums = [n for _, n, _ in num_positions]
+                print(f"\n  {sec_name}")
+                print(f"  Line  : {line[:120]}")
+                print(f"  Nums  : {[round(n, 2) for n in nums]}")
 
-                print(f"  {sec_name}: found {len(nums)} numbers: {[round(n,2) for n in nums]}")
+                h = {"name": sec_name, "all_numbers": nums}
 
-                if sec_name not in holdings:
-                    holdings[sec_name] = {"name": sec_name}
-
-                h = holdings[sec_name]
-
-                # Quantity: a small integer (typically 1–5000)
-                for _, n, raw in num_positions:
-                    if n == int(n) and 1 <= n <= 9999 and "." not in raw:
-                        h["quantity"] = int(n)
+                # Quantity: small integer in the line itself
+                int_matches = re.findall(r"\b(\d{1,4})\b", line)
+                for m in int_matches:
+                    v = int(m)
+                    if 1 <= v <= 5000:
+                        h["quantity"] = v
                         break
 
-                # The last 4 numbers in the row are typically:
-                # opening_ccy, opening_azn, closing_ccy, closing_azn
+                # Assign amounts — last 4 numbers: open_ccy, open_azn, close_ccy, close_azn
                 if len(nums) >= 4:
-                    h["opening_ccy"]  = nums[-4]
-                    h["opening_azn"]  = nums[-3]
-                    h["closing_ccy"]  = nums[-2]
-                    h["closing_azn"]  = nums[-1]
+                    h["opening_ccy"] = nums[-4]
+                    h["opening_azn"] = nums[-3]
+                    h["closing_ccy"] = nums[-2]
+                    h["closing_azn"] = nums[-1]
                 elif len(nums) >= 2:
-                    h["opening_ccy"]  = nums[-2]
-                    h["closing_ccy"]  = nums[-1]
+                    h["opening_ccy"] = nums[-2]
+                    h["closing_ccy"] = nums[-1]
                 elif len(nums) == 1:
-                    h["opening_ccy"]  = nums[0]
+                    h["opening_ccy"] = nums[0]
+
+                holdings[sec_name] = h
 
     return list(holdings.values())
 
