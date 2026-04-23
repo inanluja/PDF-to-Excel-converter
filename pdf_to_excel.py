@@ -297,6 +297,19 @@ def main():
         print(f"ERROR: Template not found: {template_path}")
         sys.exit(1)
 
+    # DEBUG: print raw PDF text to see what's being extracted
+    print("=== DEBUG: Raw PDF rows ===")
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages):
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
+            words_sorted = sorted(words, key=lambda w: (round(w["top"] / 3) * 3, w["x0"]))
+            rows = group_words_into_rows(words_sorted, y_tolerance=5)
+            print(f"\n--- Page {page_num + 1}: {len(rows)} rows, {len(words)} words ---")
+            for i, row in enumerate(rows[:60]):  # print first 60 rows
+                row_text = " ".join(w["text"] for w in row)
+                print(f"  row {i:02d}: {row_text[:120]}")
+    print("\n=== END DEBUG ===\n")
+
     print(f"Extracting from: {pdf_path}\n")
     holdings = extract_pdf_data(pdf_path)
 
